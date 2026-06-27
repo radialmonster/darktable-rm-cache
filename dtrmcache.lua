@@ -152,6 +152,38 @@ function core.detect_command(script_path, out_file)
 end
 
 -- ------------------------------------------------------------------
+-- platform capability map (which panel actions work on this OS)
+-- ------------------------------------------------------------------
+
+-- Several panel actions depend on Windows-only helpers: the native folder
+-- picker, the Desktop/Start-Menu launcher, the robocopy move, and the
+-- PowerShell size-report / clear / confirm dialogs. Off Windows those buttons
+-- can't do anything useful, so the panel grays them out rather than letting a
+-- click fail with a toast. This returns feature_key -> available(bool) for the
+-- given OS. Actions that genuinely work everywhere (open folder via
+-- open/xdg-open, copy command via pbcopy/xclip, in-process thumbnail
+-- generation) stay enabled. Pure; used by the UI to set widget.sensitive.
+function core.platform_features(os_name)
+  local win = core.is_windows(os_name)
+  return {
+    -- Windows-only helpers
+    browse       = win,   -- native IFileOpenDialog folder picker
+    launcher     = win,   -- Desktop .cmd + Start-Menu shortcut
+    size_report  = win,   -- PowerShell disk-walk size report
+    clear_cache  = win,   -- PowerShell purge of cache contents
+    move_cache   = win,   -- robocopy move behind a MessageBox confirm
+    -- cross-platform actions
+    open_folder  = true,  -- explorer / open / xdg-open
+    copy_command = true,  -- Set-Clipboard / pbcopy / xclip
+    generate     = true,  -- darktable's own in-process generator
+  }
+end
+
+-- Tooltip suffix appended to a disabled (non-Windows) button so the user knows
+-- why it is grayed out instead of silently dead.
+core.WINDOWS_ONLY_NOTE = "  (Windows only — not available on this OS)"
+
+-- ------------------------------------------------------------------
 -- thumbnail-size presets (friendly wrapper over generate-cache mip levels)
 -- ------------------------------------------------------------------
 
@@ -1532,9 +1564,17 @@ end
 -- build the panel widget (embedded in the Lua options page)
 -- ------------------------------------------------------------------
 
-local function button(label, tip, cb)
+-- Which actions are usable on this OS (Windows-only helpers vs. everywhere).
+local features = core.platform_features(dt.configuration.running_os)
+
+-- Build a button. `feature` (optional) names a key in `features`; when that
+-- capability is unavailable on this OS the button is grayed out (sensitive =
+-- false) and its tooltip explains why, instead of failing on click.
+local function button(label, tip, cb, feature)
+  local enabled = feature == nil or features[feature] ~= false
+  if not enabled then tip = tip .. core.WINDOWS_ONLY_NOTE end
   return dt.new_widget("button") {
-    label = label, tooltip = tip, clicked_callback = cb,
+    label = label, tooltip = tip, sensitive = enabled, clicked_callback = cb,
   }
 end
 
@@ -1560,7 +1600,7 @@ local container = dt.new_widget("box") {
   -- desired cache entry + actions, all in paired rows
   desired_entry,
   row(
-    button("browse…", "Pick a folder with the native Windows dialog", browse_desired),
+    button("browse…", "Pick a folder with the native Windows dialog", browse_desired, "browse"),
     button("save", "Save the desired cache directory to preferences", save_desired)),
   row(
     button("find darktable", "Auto-detect the darktable program location", find_darktable),
@@ -1583,7 +1623,7 @@ local container = dt.new_widget("box") {
   row(
     button("make start menu shortcut",
       "Create a Start Menu shortcut and a Desktop icon that start darktable with the desired cache directory",
-      write_launcher),
+      write_launcher, "launcher"),
     button("copy launch command",
       "Copy the exact darktable --cachedir startup command to the clipboard",
       copy_startup_command)),
@@ -1593,13 +1633,13 @@ local container = dt.new_widget("box") {
   row(
     button("cache size report",
       "Measure the active cache folder and show its total size and per-size breakdown",
-      cache_size_report),
+      cache_size_report, "size_report"),
     button("clear cache (free disk)",
       "Delete cached thumbnails in the active cache folder to reclaim disk space (asks first; darktable rebuilds them on demand)",
-      purge_cache)),
+      purge_cache, "clear_cache")),
   button("move active → desired",
     "Move existing cache files from the active folder to the desired folder (asks first)",
-    function() offer_move(active_cache(), get_desired()) end),
+    function() offer_move(active_cache(), get_desired()) end, "move_cache"),
 }
 widgets.container = container
 
