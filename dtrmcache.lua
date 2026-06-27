@@ -492,6 +492,128 @@ function core.move_cache_command(src, dest, os_name)
 end
 
 -- ------------------------------------------------------------------
+-- pre-flight validation (drive exists / free space) before a move
+-- ------------------------------------------------------------------
+
+-- Extract the drive-root of a Windows path:
+--   "C:\foo\bar" -> "C:\"   "d:/x" -> "D:\"
+-- Returns "" for a path with no drive letter (UNC "\\server\share" or a POSIX
+-- path), so callers can simply skip the drive check there.
+function core.drive_root(path)
+  local p = core.trim(path)
+  local letter = p:match("^(%a):")
+  if not letter then return "" end
+  return letter:upper() .. ":\\"
+end
+
+-- PowerShell helper that checks, before a move, whether the desired drive is
+-- usable. Writes machine-readable tab-separated lines to $OutFile (BOM-less):
+--   ROOT<TAB><drive root>           (always, e.g. "D:\")
+--   DRIVE_MISSING                   (the drive/root is not present)
+--   FREE<TAB><bytes>                (free space on the destination drive)
+--   NEED<TAB><bytes>                (size of $Source, when given + present)
+-- Source is the active cache being moved; measuring it here (one process)
+-- lets the caller compare "need vs free" without a second disk walk.
+-- Parsed by core.parse_preflight_report.
+function core.preflight_script_contents()
+  return [==[
+param([Parameter(Mandatory=$true)][string]$OutFile,
+      [Parameter(Mandatory=$true)][string]$Target,
+      [string]$Source = "")
+$sb = New-Object System.Text.StringBuilder
+$root = [System.IO.Path]::GetPathRoot($Target)
+[void]$sb.AppendLine("ROOT`t$root")
+if (-not $root -or -not (Test-Path -LiteralPath $root)) {
+  [void]$sb.AppendLine("DRIVE_MISSING")
+} else {
+  try {
+    $di = New-Object System.IO.DriveInfo($root)
+    [void]$sb.AppendLine("FREE`t$([int64]$di.AvailableFreeSpace)")
+  } catch { }
+  if ($Source -and (Test-Path -LiteralPath $Source)) {
+    $need = (Get-ChildItem -LiteralPath $Source -Recurse -File -Force -ErrorAction SilentlyContinue |
+             Measure-Object -Property Length -Sum).Sum
+    if (-not $need) { $need = 0 }
+    [void]$sb.AppendLine("NEED`t$([int64]$need)")
+  }
+}
+[System.IO.File]::WriteAllText($OutFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+]==]
+end
+
+-- Build the powershell invocation that runs the pre-flight helper. `source_dir`
+-- is optional (the active cache being moved); when given the script also reports
+-- its size as NEED so the caller can compare against free space.
+function core.preflight_command(script_path, out_file, target_dir, source_dir)
+  local sp = core.quote(script_path)
+  local of = core.quote(out_file)
+  local td = core.quote(core.normalize(target_dir))
+  if sp == "" or of == "" then return nil, "script and output paths are required" end
+  if td == "" then return nil, "no target directory to check" end
+  local parts = {
+    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+    "-File", sp, of, td,
+  }
+  local sd = core.quote(core.normalize(source_dir))
+  if sd ~= "" then parts[#parts + 1] = sd end
+  return table.concat(parts, " ")
+end
+
+-- Parse the pre-flight helper output into a structured report:
+--   { ok = bool, drive_missing = bool, root = string,
+--     free = number|nil, need = number|nil }
+-- ok is true once any recognizable line (ROOT or DRIVE_MISSING) was seen.
+function core.parse_preflight_report(text)
+  local t = core.trim(text)
+  local r = { ok = false, drive_missing = false, root = "", free = nil, need = nil }
+  if t == "" then return r end
+  for line in (t .. "\n"):gmatch("(.-)\n") do
+    local root = line:match("^ROOT\t(.+)$")
+    if root then r.root = core.trim(root) end
+    if line:match("^DRIVE_MISSING") then r.drive_missing = true end
+    local free = line:match("^FREE\t(%d+)")
+    if free then r.free = tonumber(free) end
+    local need = line:match("^NEED\t(%d+)")
+    if need then r.need = tonumber(need) end
+  end
+  r.ok = r.root ~= "" or r.drive_missing
+  return r
+end
+
+-- Turn a parsed pre-flight report into a verdict:
+--   { ok = bool, hard = bool, message = string }
+-- Semantics for the caller:
+--   ok=true             -> proceed; `message` is informational (free/need sizes)
+--   ok=false, hard=true -> abort (drive absent); show `message`, skip the action
+--   ok=false, hard=false-> soft warning (won't fit); fold `message` into confirm
+-- When the report could not be read we return ok=true (never block on a failed
+-- check; the move itself still reports any real error).
+function core.evaluate_preflight(r)
+  if not r or not r.ok then
+    return { ok = true, hard = false, message = "" }
+  end
+  local root = r.root ~= "" and r.root or "the desired drive"
+  if r.drive_missing then
+    return {
+      ok = false, hard = true,
+      message = "Desired drive " .. root .. " does not exist. Plug in the drive "
+        .. "or pick a different folder before moving the cache.",
+    }
+  end
+  if r.free and r.need and r.need > r.free then
+    return {
+      ok = false, hard = false,
+      message = "Not enough free space: the cache is " .. core.format_bytes(r.need)
+        .. " but only " .. core.format_bytes(r.free) .. " is free on " .. root .. ".",
+    }
+  end
+  local parts = {}
+  if r.free then parts[#parts + 1] = "free on " .. root .. ": " .. core.format_bytes(r.free) end
+  if r.need then parts[#parts + 1] = "cache to move: " .. core.format_bytes(r.need) end
+  return { ok = true, hard = false, message = table.concat(parts, "; ") }
+end
+
+-- ------------------------------------------------------------------
 -- cache size / disk-usage report
 -- ------------------------------------------------------------------
 
@@ -995,6 +1117,38 @@ local function confirm_dialog(title, message)
   return ans == "yes"
 end
 
+-- Pre-flight check before a move: confirm the desired drive exists and has
+-- enough free space for the cache. Runs the PowerShell helper, parses it, and
+-- returns core.evaluate_preflight's verdict { ok, hard, message }. Windows-only;
+-- on any read failure it returns a permissive verdict so it never blocks the
+-- move on its own (the move itself still reports real errors).
+local function run_preflight(target, source)
+  local permissive = { ok = true, hard = false, message = "" }
+  if not core.is_windows(dt.configuration.running_os) then return permissive end
+  local tmp = dt.configuration.tmp_dir .. "\\"
+  local script_path = tmp .. "dtrmcache_preflight.ps1"
+  local out_path = tmp .. "dtrmcache_preflight_out.txt"
+
+  local sf = io.open(script_path, "wb")
+  if not sf then return permissive end
+  sf:write(core.preflight_script_contents())
+  sf:close()
+  os.remove(out_path)
+
+  local cmd, err = core.preflight_command(script_path, out_path, target, source)
+  if not cmd then return permissive end
+  dt.print_log("dtrmcache: preflight: " .. cmd)
+  dt.control.execute(cmd)
+  os.remove(script_path)
+
+  local of = io.open(out_path, "rb")
+  if not of then return permissive end
+  local report = core.parse_preflight_report(of:read("*a"))
+  of:close()
+  os.remove(out_path)
+  return core.evaluate_preflight(report)
+end
+
 -- Offer to move the existing cache from `from` into `to`, behind a
 -- confirmation dialog. Destructive on the source and never automatic: it is
 -- only reachable from the explicit "move active → desired" button.
@@ -1014,12 +1168,27 @@ function offer_move(from, to)
     dt.print_toast("dtrmcache: confirm-to-move is Windows-only; move the folder manually")
     return
   end
+  -- Pre-flight: bail out cleanly if the destination drive is gone; surface a
+  -- low-space warning (and the free/cache sizes) inside the confirm prompt.
+  local pf = run_preflight(to, from)
+  if not pf.ok and pf.hard then
+    dt.print_toast("dtrmcache: " .. pf.message)
+    dt.print_log("dtrmcache: move aborted (preflight): " .. pf.message)
+    return
+  end
+  local extra = ""
+  if not pf.ok then
+    extra = "\n\nWARNING: " .. pf.message
+  elseif pf.message ~= "" then
+    extra = "\n\n(" .. pf.message .. ")"
+  end
   local ok, derr = confirm_dialog("dtrmcache: move cache",
     "Move existing cache files from the active folder to the desired folder? "
       .. "darktable is using the active cache right now, so files it has open "
       .. "are left behind and the cache may end up split between both folders. "
       .. "For a clean move, do this with darktable closed. darktable keeps using "
-      .. "the active folder until you relaunch it with the desired cache directory.")
+      .. "the active folder until you relaunch it with the desired cache directory."
+      .. extra)
   if derr then
     dt.print_toast("dtrmcache: " .. derr)
     return
