@@ -1031,38 +1031,48 @@ function offer_move(from, to)
   run_async("move cache", cmd, robocopy_ok)
 end
 
--- Build thumbnails for the whole library using darktable's own in-process
--- generator (image:generate_cache). Unlike the external darktable-generate-cache
--- tool this runs INSIDE darktable, so:
+-- Build thumbnails using darktable's own in-process generator
+-- (image:generate_cache). Unlike the external darktable-generate-cache tool
+-- this runs INSIDE darktable, so:
 --   * it needs no exclusive database lock (darktable already holds it),
 --   * it always targets darktable's active cache dir (no --cachedir needed),
 --   * it skips images that already have a thumbnail on disk, so it RESUMES if
 --     you stop/restart, and re-running is cheap.
 -- Runs on a background job so the UI stays responsive.
+--
+-- `generating` guards against two jobs at once; `cancel_requested` is the abort
+-- flag the loop checks each iteration so a long run can be stopped (see
+-- stop_generation) without quitting darktable.
 local generating = false
-local function generate_now()
+local cancel_requested = false
+
+-- Core worker: build thumbnails for the images in `list` (an array of
+-- dt_lua_image_t). `what` names the set ("whole library" / "selected images")
+-- for the toasts. Honors cancel_requested between images.
+local function run_generation(list, what)
   if generating then
     dt.print_toast("dtrmcache: thumbnail generation is already running")
     return
   end
-  local max = get_max_mip()
-  local db = dt.database
-  local total = 0
-  for _ in ipairs(db) do total = total + 1 end
+  local total = #list
   if total == 0 then
-    dt.print_toast("dtrmcache: no images in the library")
+    dt.print_toast("dtrmcache: no images to process (" .. what .. ")")
     return
   end
+  local max = get_max_mip()
   generating = true
+  cancel_requested = false
   dt.print_toast("dtrmcache: building thumbnails for " .. total
-    .. " images — you can keep working")
-  dt.print_log("dtrmcache: generate_cache mip 0.." .. max .. " for " .. total .. " images")
+    .. " " .. what .. " — you can keep working")
+  dt.print_log("dtrmcache: generate_cache mip 0.." .. max .. " for "
+    .. total .. " images (" .. what .. ")")
   dt.control.dispatch(function()
     -- Wrap the whole job so an unexpected error can never leave `generating`
     -- stuck true (which would dead-lock the button until darktable restarts).
     local ok, err = pcall(function()
-      local done, failed = 0, 0
-      for i, img in ipairs(db) do
+      local done, failed, stopped = 0, 0, false
+      for i, img in ipairs(list) do
+        if cancel_requested then stopped = true; break end
         -- check_dirs only needs to be true once: the mip cache directories are
         -- shared across all images, so create them on the first image only
         -- (see dt_lua_image_t:generate_cache docs) and skip the redundant
@@ -1075,17 +1085,46 @@ local function generate_now()
           dt.control.sleep(1)  -- yield briefly so the UI stays smooth
         end
       end
-      local msg = "dtrmcache: thumbnails finished (" .. done .. "/" .. total .. ")"
+      local msg = "dtrmcache: thumbnails " .. (stopped and "stopped" or "finished")
+        .. " (" .. done .. "/" .. total .. ")"
       if failed > 0 then msg = msg .. ", " .. failed .. " skipped/failed" end
       dt.print_toast(msg)
       dt.print_log(msg)
     end)
     generating = false  -- always clear, even if the job errored out
+    cancel_requested = false
     if not ok then
       dt.print_toast("dtrmcache: thumbnail generation stopped on an error")
       dt.print_log("dtrmcache: generate_cache error: " .. tostring(err))
     end
   end)
+end
+
+-- Generate for the whole library.
+local function generate_now()
+  local list = {}
+  for _, img in ipairs(dt.database) do list[#list + 1] = img end
+  run_generation(list, "whole library")
+end
+
+-- Generate for the current selection only — the common "these few thumbnails
+-- look wrong, just redo them" case. Uses darktable.gui.action_images, which
+-- reflects the selection (and hovered image) the way the rest of the GUI does.
+local function generate_selected()
+  local list = {}
+  for _, img in ipairs(dt.gui.action_images) do list[#list + 1] = img end
+  run_generation(list, "selected images")
+end
+
+-- Ask a running generation job to stop. The job checks cancel_requested before
+-- each image, so it ends after the image currently in flight.
+local function stop_generation()
+  if not generating then
+    dt.print_toast("dtrmcache: no thumbnail generation is running")
+    return
+  end
+  cancel_requested = true
+  dt.print_toast("dtrmcache: stopping after the current image…")
 end
 
 -- Native Windows folder picker: write a temp .ps1, run it, read the
@@ -1358,11 +1397,20 @@ local container = dt.new_widget("box") {
     button("find darktable", "Auto-detect the darktable program location", find_darktable),
     button("refresh", "Re-read active cache and preferences", refresh)),
   thumb_combo,
-  button("generate thumbnails now",
-    "Build thumbnails for your whole library into the active cache, using "
-      .. "darktable itself. Runs in the background, works while darktable is "
-      .. "open, and skips images already done (so it resumes if interrupted).",
-    generate_now),
+  row(
+    button("generate all thumbnails",
+      "Build thumbnails for your whole library into the active cache, using "
+        .. "darktable itself. Runs in the background, works while darktable is "
+        .. "open, and skips images already done (so it resumes if interrupted).",
+      generate_now),
+    button("generate selected",
+      "Build thumbnails for the currently selected images only — handy when "
+        .. "a few thumbnails look wrong and you just want to redo those.",
+      generate_selected)),
+  button("stop generating",
+    "Stop a running thumbnail-generation job after the current image (does not "
+      .. "quit darktable; already-built thumbnails are kept).",
+    stop_generation),
   row(
     button("make start menu shortcut",
       "Create a Start Menu shortcut and a Desktop icon that start darktable with the desired cache directory",
