@@ -89,6 +89,18 @@ function core.quote(path)
   return '"' .. p:gsub('"', '\\"') .. '"'
 end
 
+-- Human-readable byte count: 0..1023 as "N B", then KB/MB/GB/TB with one
+-- decimal. Used by the cache size report. Pure; no IO.
+function core.format_bytes(n)
+  n = tonumber(n) or 0
+  if n < 0 then n = 0 end
+  local units = { "B", "KB", "MB", "GB", "TB" }
+  local i, v = 1, n
+  while v >= 1024 and i < #units do v = v / 1024; i = i + 1 end
+  if i == 1 then return string.format("%d B", math.floor(n + 0.5)) end
+  return string.format("%.1f %s", v, units[i])
+end
+
 -- ------------------------------------------------------------------
 -- darktable executable auto-detection
 -- ------------------------------------------------------------------
@@ -480,6 +492,137 @@ function core.move_cache_command(src, dest, os_name)
 end
 
 -- ------------------------------------------------------------------
+-- cache size / disk-usage report
+-- ------------------------------------------------------------------
+
+-- PowerShell helper that measures the size of a cache directory. Writes
+-- machine-readable, tab-separated lines to $OutFile (BOM-less):
+--   MISSING                         (the directory does not exist)
+--   TOTAL<TAB><bytes>               (sum of every file under the tree)
+--   MIP<TAB><level><TAB><bytes>     (one per mip level, sorted ascending)
+-- darktable stores thumbnails as <cache>/mipmaps-*.d/<level>/<imgid>.jpg
+-- (see src/common/mipmap_cache.c), so the per-mip breakdown groups files by
+-- the numeric directory under any "*.d" folder. Parsed by core.parse_size_report.
+function core.size_script_contents()
+  return [==[
+param([Parameter(Mandatory=$true)][string]$OutFile,
+      [Parameter(Mandatory=$true)][string]$Target)
+$sb = New-Object System.Text.StringBuilder
+if (-not (Test-Path -LiteralPath $Target)) {
+  [void]$sb.AppendLine("MISSING")
+} else {
+  $all = Get-ChildItem -LiteralPath $Target -Recurse -File -Force -ErrorAction SilentlyContinue
+  $total = ($all | Measure-Object -Property Length -Sum).Sum
+  if (-not $total) { $total = 0 }
+  [void]$sb.AppendLine("TOTAL`t$([int64]$total)")
+  $mips = @{}
+  foreach ($f in $all) {
+    if ($f.FullName -match '\.d\\(\d+)\\') {
+      $lvl = [int]$Matches[1]
+      $mips[$lvl] = [int64]($mips[$lvl]) + [int64]$f.Length
+    }
+  }
+  foreach ($lvl in ($mips.Keys | Sort-Object)) {
+    [void]$sb.AppendLine("MIP`t$lvl`t$([int64]$mips[$lvl])")
+  }
+}
+[System.IO.File]::WriteAllText($OutFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+]==]
+end
+
+-- Build the powershell invocation that runs the size helper script.
+function core.size_command(script_path, out_file, target_dir)
+  local sp = core.quote(script_path)
+  local of = core.quote(out_file)
+  local td = core.quote(core.normalize(target_dir))
+  if sp == "" or of == "" then return nil, "script and output paths are required" end
+  if td == "" then return nil, "no cache directory to measure" end
+  return table.concat({
+    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+    "-File", sp, of, td,
+  }, " ")
+end
+
+-- Parse the size helper output into a structured report:
+--   { ok = bool, missing = bool, total = number, mips = { [level] = bytes } }
+function core.parse_size_report(text)
+  local t = core.trim(text)
+  if t == "" then return { ok = false } end
+  if t:upper():find("MISSING", 1, true) then return { ok = false, missing = true } end
+  local r = { ok = false, total = 0, mips = {} }
+  for line in (t .. "\n"):gmatch("(.-)\n") do
+    local total = line:match("^TOTAL\t(%d+)")
+    if total then r.total = tonumber(total); r.ok = true end
+    local lvl, bytes = line:match("^MIP\t(%d+)\t(%d+)")
+    if lvl then r.mips[tonumber(lvl)] = tonumber(bytes) end
+  end
+  return r
+end
+
+-- Render a parsed size report as friendly multi-line text.
+function core.format_size_report(r)
+  if not r or r.missing then return "Cache size: folder does not exist yet" end
+  if not r.ok then return "Cache size: (could not read)" end
+  local lines = { "Cache size: " .. core.format_bytes(r.total) }
+  local levels = {}
+  for lvl in pairs(r.mips) do levels[#levels + 1] = lvl end
+  table.sort(levels)
+  for _, lvl in ipairs(levels) do
+    lines[#lines + 1] = "  mip " .. lvl .. ": " .. core.format_bytes(r.mips[lvl])
+  end
+  return table.concat(lines, "\n")
+end
+
+-- ------------------------------------------------------------------
+-- clear / purge the cache (the "rm" the repo name promises)
+-- ------------------------------------------------------------------
+
+-- Build a command that deletes the *contents* of the cache directory (not the
+-- directory itself, which the running darktable keeps open). darktable rebuilds
+-- thumbnails on demand, so this is a safe "reclaim disk space" action — see the
+-- cache_disk_backend longdescription in darktableconfig.xml.in ("it's safe to
+-- delete these manually"). MUST be run behind an explicit confirmation.
+-- Files darktable currently holds open (e.g. the live mipmaps db) are skipped.
+-- Returns cmd, nil  or  nil, err.
+function core.purge_cache_command(path, os_name)
+  local dir = core.normalize(path)
+  if dir == "" then return nil, "no cache directory to clear" end
+  if core.is_windows(os_name) then
+    -- single-quoted PowerShell literal; double any embedded single quote.
+    local lit = dir:gsub("'", "''")
+    return 'powershell -NoProfile -ExecutionPolicy Bypass -Command "'
+      .. "Get-ChildItem -LiteralPath '" .. lit .. "' -Force | "
+      .. 'Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"'
+  else
+    -- delete visible + dotfile contents, keep the directory itself.
+    return "find " .. core.quote(dir) .. " -mindepth 1 -delete"
+  end
+end
+
+-- ------------------------------------------------------------------
+-- cache health checklist (read-only diagnostics)
+-- ------------------------------------------------------------------
+
+-- Summarize the three darktable cache-related core preferences in plain
+-- language. Values are read by the caller via
+-- dt.preferences.read("darktable", <name>, <type>) and passed in here:
+--   disk_backend       cache_disk_backend        (bool)
+--   disk_backend_full  cache_disk_backend_full   (bool)
+--   backthumbs         backthumbs_mipsize        (enum string, "" -> "never")
+-- Returns a multi-line string suitable for a status label.
+function core.health_checklist(disk_backend, disk_backend_full, backthumbs)
+  local function mark(b) return b and "[on] " or "[off]" end
+  local bt = core.trim(backthumbs)
+  if bt == "" then bt = "never" end
+  return table.concat({
+    "Cache health:",
+    "  " .. mark(disk_backend) .. " disk thumbnail cache",
+    "  " .. mark(disk_backend_full) .. " full-preview disk cache",
+    "  " .. mark(bt ~= "never") .. " background thumbnails (" .. bt .. ")",
+  }, "\n")
+end
+
+-- ------------------------------------------------------------------
 -- native Windows confirmation dialog (PowerShell MessageBox)
 -- ------------------------------------------------------------------
 
@@ -723,6 +866,12 @@ local status_label = dt.new_widget("label") {
 local exe_label = dt.new_widget("label") {
   label = "", selectable = true, halign = "start",
 }
+local health_label = dt.new_widget("label") {
+  label = "", selectable = true, halign = "start",
+}
+local size_label = dt.new_widget("label") {
+  label = "Cache size: click 'cache size report'", selectable = true, halign = "start",
+}
 
 local desired_entry = dt.new_widget("entry") {
   tooltip = "Desired cache directory. Saved to plugin preferences.",
@@ -765,6 +914,15 @@ local function refresh()
   else
     exe_label.label = "darktable: NOT FOUND — click 'find darktable' or set it in preferences"
   end
+
+  -- Read darktable's own cache-related core preferences. Passing "darktable" as
+  -- the script name reaches the core preferences (see darktable.preferences
+  -- docs); these are read-only diagnostics.
+  local ok, db = pcall(dt.preferences.read, "darktable", "cache_disk_backend", "bool")
+  local _, dbf = pcall(dt.preferences.read, "darktable", "cache_disk_backend_full", "bool")
+  local _, bt = pcall(dt.preferences.read, "darktable", "backthumbs_mipsize", "string")
+  if not ok then db = nil end
+  health_label.label = core.health_checklist(db, dbf, bt)
 end
 
 -- Persist the entry text into the preference, then refresh. Saving only records
@@ -1084,6 +1242,84 @@ local function open_folder(use_desired)
   dt.control.execute(cmd)
 end
 
+-- Measure the active cache directory and show a total + per-mip breakdown.
+-- Read-only. The disk walk runs on a background job so the UI stays responsive.
+local function cache_size_report()
+  if not core.is_windows(dt.configuration.running_os) then
+    dt.print_toast("dtrmcache: the size report is Windows-only")
+    return
+  end
+  local active = active_cache()
+  if core.trim(active) == "" then
+    dt.print_toast("dtrmcache: no active cache directory")
+    return
+  end
+  local tmp = dt.configuration.tmp_dir .. "\\"
+  local script_path = tmp .. "dtrmcache_size.ps1"
+  local out_path = tmp .. "dtrmcache_size_out.txt"
+
+  local sf = io.open(script_path, "wb")
+  if not sf then
+    dt.print_toast("dtrmcache: could not write size helper")
+    return
+  end
+  sf:write(core.size_script_contents())
+  sf:close()
+  os.remove(out_path)
+
+  local cmd, err = core.size_command(script_path, out_path, active)
+  if not cmd then
+    dt.print_toast("dtrmcache: " .. err)
+    return
+  end
+  size_label.label = "Cache size: computing…"
+  dt.print_log("dtrmcache: size: " .. cmd)
+  dt.control.dispatch(function()
+    dt.control.execute(cmd)
+    os.remove(script_path)
+    local report = { ok = false }
+    local of = io.open(out_path, "rb")
+    if of then
+      report = core.parse_size_report(of:read("*a"))
+      of:close()
+      os.remove(out_path)
+    end
+    size_label.label = core.format_size_report(report)
+    dt.print_log("dtrmcache: " .. size_label.label:gsub("\n", " | "))
+  end)
+end
+
+-- Delete the cached thumbnails in the active cache folder to reclaim disk space
+-- (the "rm" the repo name promises). Behind a Yes/No confirmation; never
+-- automatic. darktable rebuilds thumbnails on demand, so it is a safe action.
+local function purge_cache()
+  local active = active_cache()
+  local cmd, err = core.purge_cache_command(active, dt.configuration.running_os)
+  if not cmd then
+    dt.print_toast("dtrmcache: " .. err)
+    return
+  end
+  if not core.is_windows(dt.configuration.running_os) then
+    dt.print_toast("dtrmcache: clearing the cache is Windows-only for now; delete it manually")
+    return
+  end
+  local ok, derr = confirm_dialog("dtrmcache: clear cache",
+    "Delete all cached thumbnails in the active cache folder to free disk space? "
+      .. "darktable rebuilds thumbnails automatically as you browse, so this is safe. "
+      .. "Files darktable currently has open are skipped. Active cache: " .. active)
+  if derr then
+    dt.print_toast("dtrmcache: " .. derr)
+    return
+  end
+  if not ok then
+    dt.print_toast("dtrmcache: clear cancelled")
+    return
+  end
+  run_async("clear cache", cmd)
+  -- refresh the size readout after a clear so the freed space shows.
+  size_label.label = "Cache size: click 'cache size report'"
+end
+
 -- ------------------------------------------------------------------
 -- build the panel widget (embedded in the Lua options page)
 -- ------------------------------------------------------------------
@@ -1105,11 +1341,13 @@ end
 local container = dt.new_widget("box") {
   orientation = "vertical",
 
-  -- status (compact: four labels, no section header)
+  -- status (compact: labels, no section header)
   active_label,
   desired_label,
   status_label,
   exe_label,
+  health_label,
+  size_label,
 
   -- desired cache entry + actions, all in paired rows
   desired_entry,
@@ -1135,6 +1373,13 @@ local container = dt.new_widget("box") {
   row(
     button("open active", "Open the active cache folder", function() open_folder(false) end),
     button("open desired", "Open the desired cache folder", function() open_folder(true) end)),
+  row(
+    button("cache size report",
+      "Measure the active cache folder and show its total size and per-size breakdown",
+      cache_size_report),
+    button("clear cache (free disk)",
+      "Delete cached thumbnails in the active cache folder to reclaim disk space (asks first; darktable rebuilds them on demand)",
+      purge_cache)),
   button("move active → desired",
     "Move existing cache files from the active folder to the desired folder (asks first)",
     function() offer_move(active_cache(), get_desired()) end),
