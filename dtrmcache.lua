@@ -59,8 +59,9 @@ end
 function core.normalize(path)
   local p = core.trim(path)
   if p == "" then return "" end
-  -- strip one trailing slash/backslash unless it is the whole string
-  if #p > 1 then
+  -- strip one trailing slash/backslash, but keep a bare drive root ("C:\"):
+  -- stripping it would yield "C:", a drive-relative path, not the root.
+  if #p > 1 and not p:match("^%a:[/\\]?$") then
     p = p:gsub("[/\\]$", "")
   end
   return p
@@ -80,10 +81,12 @@ end
 
 -- Double-quote a path for use as a shell argument.
 -- Returns "" for an empty/nil path so callers can detect "no value".
+-- An embedded double-quote is escaped (\") so the argument stays well-formed;
+-- this never fires on Windows (" is illegal in paths) but guards POSIX names.
 function core.quote(path)
   local p = core.trim(path)
   if p == "" then return "" end
-  return '"' .. p .. '"'
+  return '"' .. p:gsub('"', '\\"') .. '"'
 end
 
 -- ------------------------------------------------------------------
@@ -394,7 +397,10 @@ end
 -- ------------------------------------------------------------------
 
 function core.open_folder_command(path, os_name)
-  local dir = core.trim(path)
+  -- normalize() drops a trailing separator: on Windows a quoted dir ending in
+  -- "\" (e.g. explorer "D:\foo\") has its closing quote escaped by the
+  -- backslash, which makes Explorer open the wrong folder.
+  local dir = core.normalize(path)
   if dir == "" then return nil, "no folder to open" end
   if core.is_windows(os_name) then
     return "explorer " .. core.quote(dir)
@@ -664,6 +670,7 @@ local function detect_darktable_exe()
       os.remove(out_path)
       local cmd = core.detect_command(script_path, out_path)
       if cmd then dt.control.execute(cmd) end
+      os.remove(script_path)  -- helper has served its purpose
       local of = io.open(out_path, "rb")
       if of then
         local p = core.trim(of:read("*a"))
@@ -820,6 +827,7 @@ local function confirm_dialog(title, message)
   local cmd, err = core.confirm_command(script_path, out_path, title, message)
   if not cmd then return false, err end
   dt.control.execute(cmd)  -- modal; blocks until the user answers
+  os.remove(script_path)   -- helper has served its purpose
 
   local of = io.open(out_path, "rb")
   if not of then return false end  -- absent output == No/closed
@@ -953,6 +961,7 @@ local function browse_desired()
 
   dt.print_log("dtrmcache: browse: " .. cmd)
   dt.control.execute(cmd)  -- modal dialog; blocks until the user closes it
+  os.remove(script_path)   -- helper has served its purpose
 
   local of = io.open(out_path, "rb")
   if not of then
@@ -1012,6 +1021,7 @@ local function write_launcher()
   end
   dt.print_log("dtrmcache: install launcher: " .. cmd)
   dt.control.execute(cmd)
+  os.remove(script_path)  -- helper has served its purpose
 
   local of = io.open(out_path, "rb")
   if of then
@@ -1035,9 +1045,10 @@ local function copy_startup_command()
   -- shell out to copy its contents to the clipboard.
   local tmp = dt.configuration.tmp_dir .. "\\dtrmcache_startup.txt"
   local f = io.open(tmp, "wb")
-  if f then f:write(cmd); f:close() end
+  local wrote = false
+  if f then f:write(cmd); f:close(); wrote = true end
   local clip, cerr = core.clipboard_command(tmp, dt.configuration.running_os)
-  if clip and f then
+  if clip and wrote then
     dt.control.execute(clip)
     dt.print_toast("dtrmcache: startup command copied to clipboard")
   else

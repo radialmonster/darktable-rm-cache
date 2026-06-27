@@ -99,6 +99,12 @@ Targets darktable 5.6 (Lua API 9.x).
 
 ## Development
 
+> [!IMPORTANT]
+> **This is the end-user (published) repository — do not edit `dtrmcache.lua`
+> here.** It is a generated artifact and any changes made directly to it will be
+> overwritten on the next build. All development — bug fixes, features, tests —
+> must be done in the development repository, then rebuilt and republished here.
+
 This repository contains only the built plugin for end users. The source code,
 tests, build tooling, and roadmap live in the development repository:
 
@@ -106,4 +112,8 @@ tests, build tooling, and roadmap live in the development repository:
 https://github.com/radialmonster/darktable-rm-cache-dev
 ```
 
-`dtrmcache.lua` is generated there from the split sources and published here.
+Locally that is the sibling folder `../darktable-cache-dev`. The split sources
+live under `plugins/dev/src/dtcache/` (`dtcache.lua` for the UI,
+`dtcache_core.lua` for the IO-free helpers), with tests in
+`plugins/dev/tests/`. `dtrmcache.lua` is generated from those sources by
+`tools/build-single-file.ps1` and published here.
